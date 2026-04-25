@@ -4,18 +4,21 @@ from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 from dotenv import load_dotenv
 
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN in your .env file.")
 
+
+# -----------------------------
+# CHOICES
+# -----------------------------
 
 ATTRIBUTE_CHOICES = [
     app_commands.Choice(name="Strength", value="Strength"),
@@ -131,6 +134,40 @@ MODIFIER_CHOICES = [
 ]
 
 
+# -----------------------------
+# BOT SETUP
+# -----------------------------
+
+class VTMClient(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        if DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
+            guild = discord.Object(id=int(DISCORD_GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            print(f"Synced commands to guild {DISCORD_GUILD_ID}.")
+        else:
+            await self.tree.sync()
+            print("Synced global commands.")
+            print("Tip: Add DISCORD_GUILD_ID to .env if you want commands to show faster in one server.")
+
+
+client = VTMClient()
+
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}.")
+
+
+# -----------------------------
+# VTM DICE LOGIC
+# -----------------------------
+
 def roll_vtm(pool: int, hunger: int, difficulty: int) -> dict:
     pool = max(pool, 1)
     hunger = max(0, min(hunger, 5, pool))
@@ -143,48 +180,112 @@ def roll_vtm(pool: int, hunger: int, difficulty: int) -> dict:
 
     all_dice = normal_dice + hunger_dice
 
-    successes = sum(1 for die in all_dice if die >= 6)
+    base_successes = sum(1 for die in all_dice if die >= 6)
 
     normal_tens = sum(1 for die in normal_dice if die == 10)
     hunger_tens = sum(1 for die in hunger_dice if die == 10)
-    total_tens = normal_tens + hunger_tens
+    hunger_ones = sum(1 for die in hunger_dice if die == 1)
 
+    total_tens = normal_tens + hunger_tens
     critical_pairs = total_tens // 2
 
-    # In V5, a pair of 10s counts as a critical.
-    # Since those two 10s already counted as 2 successes,
-    # each critical pair adds 2 more successes, making the pair worth 4 total.
-    successes += critical_pairs * 2
+    # In VTM 5e, a pair of 10s is a critical.
+    # The two 10s already count as 2 successes.
+    # Each critical pair adds 2 more successes, making that pair worth 4 total.
+    total_successes = base_successes + (critical_pairs * 2)
 
     has_difficulty = difficulty > 0
-    is_win = successes >= difficulty if has_difficulty else None
+    is_win = total_successes >= difficulty if has_difficulty else None
 
-    messy_critical = bool(has_difficulty and is_win and critical_pairs > 0 and hunger_tens > 0)
-    bestial_failure = bool(has_difficulty and not is_win and any(die == 1 for die in hunger_dice))
+    messy_critical = bool(
+        has_difficulty
+        and is_win
+        and critical_pairs > 0
+        and hunger_tens > 0
+    )
 
-    if not has_difficulty:
-        outcome = "Successes Counted"
-    elif messy_critical:
-        outcome = "Messy Critical"
-    elif bestial_failure:
-        outcome = "Bestial Failure"
-    elif is_win and critical_pairs > 0:
-        outcome = "Critical Win"
-    elif is_win:
-        outcome = "Win"
+    bestial_failure = bool(
+        has_difficulty
+        and not is_win
+        and hunger_ones > 0
+    )
+
+    critical_win = bool(
+        has_difficulty
+        and is_win
+        and critical_pairs > 0
+        and not messy_critical
+    )
+
+    if has_difficulty:
+        if messy_critical:
+            outcome = "🩸 Messy Critical"
+            outcome_note = (
+                "The roll succeeds with a critical, but at least one 10 was on a Hunger die. "
+                "The Beast stains the victory."
+            )
+            color = discord.Color.dark_red()
+        elif bestial_failure:
+            outcome = "🐺 Bestial Failure"
+            outcome_note = (
+                "The roll fails and at least one Hunger die came up 1. "
+                "The Beast lashes out."
+            )
+            color = discord.Color.red()
+        elif critical_win:
+            outcome = "✨ Critical Win"
+            outcome_note = "The roll succeeds with a clean critical."
+            color = discord.Color.gold()
+        elif is_win:
+            outcome = "✅ Win"
+            outcome_note = "The roll meets or beats the Difficulty."
+            color = discord.Color.green()
+        else:
+            outcome = "❌ Failure"
+            outcome_note = "The roll does not meet the Difficulty."
+            color = discord.Color.dark_gray()
     else:
-        outcome = "Failure"
+        if critical_pairs > 0 and hunger_tens > 0:
+            outcome = "🩸 Possible Messy Critical"
+            outcome_note = (
+                "A critical was rolled with a 10 on a Hunger die. "
+                "If this roll counts as a success, treat it as a Messy Critical."
+            )
+            color = discord.Color.dark_red()
+        elif critical_pairs > 0:
+            outcome = "✨ Critical Rolled"
+            outcome_note = (
+                "A critical was rolled. No Difficulty was set, so the bot is only counting successes."
+            )
+            color = discord.Color.gold()
+        elif hunger_ones > 0:
+            outcome = "🐺 Possible Bestial Failure"
+            outcome_note = (
+                "A Hunger die rolled a 1. If this roll fails, it becomes a Bestial Failure."
+            )
+            color = discord.Color.red()
+        else:
+            outcome = "Successes Counted"
+            outcome_note = "No Difficulty was set, so the bot is only counting total successes."
+            color = discord.Color.blurple()
 
     return {
         "pool": pool,
         "hunger": hunger,
         "normal_dice": normal_dice,
         "hunger_dice": hunger_dice,
-        "successes": successes,
+        "base_successes": base_successes,
+        "successes": total_successes,
+        "normal_tens": normal_tens,
+        "hunger_tens": hunger_tens,
+        "hunger_ones": hunger_ones,
         "critical_pairs": critical_pairs,
         "outcome": outcome,
+        "outcome_note": outcome_note,
         "messy_critical": messy_critical,
         "bestial_failure": bestial_failure,
+        "critical_win": critical_win,
+        "color": color,
     }
 
 
@@ -193,6 +294,7 @@ def format_dice(dice: list[int]) -> str:
         return "None"
 
     formatted = []
+
     for die in dice:
         if die == 10:
             formatted.append(f"**{die}**")
@@ -218,7 +320,7 @@ async def send_roll_result(
 
     embed = discord.Embed(
         title=f"🩸 {title}",
-        color=discord.Color.dark_red(),
+        color=result["color"],
     )
 
     embed.add_field(name="Dice Pool", value=str(result["pool"]), inline=True)
@@ -230,11 +332,36 @@ async def send_roll_result(
     )
 
     embed.add_field(name="Breakdown", value=breakdown, inline=False)
-    embed.add_field(name="Normal Dice", value=format_dice(result["normal_dice"]), inline=False)
-    embed.add_field(name="Hunger Dice", value=format_dice(result["hunger_dice"]), inline=False)
+
+    embed.add_field(
+        name="Normal Dice",
+        value=format_dice(result["normal_dice"]),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Hunger Dice",
+        value=format_dice(result["hunger_dice"]),
+        inline=False,
+    )
+
     embed.add_field(name="Successes", value=str(result["successes"]), inline=True)
     embed.add_field(name="Critical Pairs", value=str(result["critical_pairs"]), inline=True)
-    embed.add_field(name="Outcome", value=f"**{result['outcome']}**", inline=False)
+
+    embed.add_field(
+        name="Hunger Signs",
+        value=(
+            f"Hunger 10s: **{result['hunger_tens']}**\n"
+            f"Hunger 1s: **{result['hunger_ones']}**"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Outcome",
+        value=f"**{result['outcome']}**\n{result['outcome_note']}",
+        inline=False,
+    )
 
     if modifier != 0:
         embed.set_footer(text=f"Modifier applied: {modifier:+}")
@@ -242,28 +369,11 @@ async def send_roll_result(
     await interaction.response.send_message(embed=embed, ephemeral=private)
 
 
-class VTMBot(commands.Bot):
-    async def setup_hook(self):
-        if DISCORD_GUILD_ID:
-            guild = discord.Object(id=int(DISCORD_GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            print(f"Synced commands to guild {DISCORD_GUILD_ID}.")
-        else:
-            await self.tree.sync()
-            print("Synced global commands.")
+# -----------------------------
+# SLASH COMMANDS
+# -----------------------------
 
-
-intents = discord.Intents.default()
-bot = VTMBot(command_prefix="!", intents=intents)
-
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}.")
-
-
-@bot.tree.command(name="vphysical", description="Roll a VTM 5e Physical Skill test.")
+@client.tree.command(name="vphysical", description="Roll a VTM 5e Physical Skill test.")
 @app_commands.describe(
     attribute="Choose the Attribute.",
     attribute_dots="Choose Attribute dots.",
@@ -296,10 +406,19 @@ async def vphysical(
 ):
     pool = attribute_dots + skill_dots + modifier
     breakdown = f"{attribute} {attribute_dots} + {skill} {skill_dots} + modifier {modifier:+}"
-    await send_roll_result(interaction, "VTM Physical Roll", pool, hunger, difficulty, modifier, breakdown, private)
+    await send_roll_result(
+        interaction,
+        "VTM Physical Roll",
+        pool,
+        hunger,
+        difficulty,
+        modifier,
+        breakdown,
+        private,
+    )
 
 
-@bot.tree.command(name="vsocial", description="Roll a VTM 5e Social Skill test.")
+@client.tree.command(name="vsocial", description="Roll a VTM 5e Social Skill test.")
 @app_commands.describe(
     attribute="Choose the Attribute.",
     attribute_dots="Choose Attribute dots.",
@@ -332,10 +451,19 @@ async def vsocial(
 ):
     pool = attribute_dots + skill_dots + modifier
     breakdown = f"{attribute} {attribute_dots} + {skill} {skill_dots} + modifier {modifier:+}"
-    await send_roll_result(interaction, "VTM Social Roll", pool, hunger, difficulty, modifier, breakdown, private)
+    await send_roll_result(
+        interaction,
+        "VTM Social Roll",
+        pool,
+        hunger,
+        difficulty,
+        modifier,
+        breakdown,
+        private,
+    )
 
 
-@bot.tree.command(name="vmental", description="Roll a VTM 5e Mental Skill test.")
+@client.tree.command(name="vmental", description="Roll a VTM 5e Mental Skill test.")
 @app_commands.describe(
     attribute="Choose the Attribute.",
     attribute_dots="Choose Attribute dots.",
@@ -368,10 +496,19 @@ async def vmental(
 ):
     pool = attribute_dots + skill_dots + modifier
     breakdown = f"{attribute} {attribute_dots} + {skill} {skill_dots} + modifier {modifier:+}"
-    await send_roll_result(interaction, "VTM Mental Roll", pool, hunger, difficulty, modifier, breakdown, private)
+    await send_roll_result(
+        interaction,
+        "VTM Mental Roll",
+        pool,
+        hunger,
+        difficulty,
+        modifier,
+        breakdown,
+        private,
+    )
 
 
-@bot.tree.command(name="vdiscipline", description="Roll a VTM 5e Discipline test.")
+@client.tree.command(name="vdiscipline", description="Roll a VTM 5e Discipline test.")
 @app_commands.describe(
     attribute="Choose the Attribute.",
     attribute_dots="Choose Attribute dots.",
@@ -404,10 +541,19 @@ async def vdiscipline(
 ):
     pool = attribute_dots + discipline_dots + modifier
     breakdown = f"{attribute} {attribute_dots} + {discipline} {discipline_dots} + modifier {modifier:+}"
-    await send_roll_result(interaction, "VTM Discipline Roll", pool, hunger, difficulty, modifier, breakdown, private)
+    await send_roll_result(
+        interaction,
+        "VTM Discipline Roll",
+        pool,
+        hunger,
+        difficulty,
+        modifier,
+        breakdown,
+        private,
+    )
 
 
-@bot.tree.command(name="vcustom", description="Roll a custom VTM 5e dice pool.")
+@client.tree.command(name="vcustom", description="Roll a custom VTM 5e dice pool.")
 @app_commands.describe(
     pool="Total dice pool.",
     hunger="Choose Hunger dice.",
@@ -432,7 +578,20 @@ async def vcustom(
 ):
     final_pool = pool + modifier
     breakdown = f"Custom pool {pool} + modifier {modifier:+}"
-    await send_roll_result(interaction, f"VTM {label}", final_pool, hunger, difficulty, modifier, breakdown, private)
+    await send_roll_result(
+        interaction,
+        f"VTM {label}",
+        final_pool,
+        hunger,
+        difficulty,
+        modifier,
+        breakdown,
+        private,
+    )
 
 
-bot.run(DISCORD_TOKEN)
+# -----------------------------
+# START BOT
+# -----------------------------
+
+client.run(DISCORD_TOKEN)
